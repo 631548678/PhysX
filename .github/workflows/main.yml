@@ -45,16 +45,21 @@ jobs:
       - name: Configure Preset & Generate PhysX Projects
         shell: pwsh
         env:
-          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
-          NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
-          ANDROID_NDK: ${{ steps.setup-ndk.outputs.ndk-path }}
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          RAW_NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
           LIB_TYPE: ${{ github.event.inputs.lib_type || 'static' }}
         run: |
           $ErrorActionPreference = "Stop"
-          Write-Host "NDK Path: $env:ANDROID_NDK_ROOT"
+          # 将反斜杠转为正斜杠，防止 CMake 解析路径转义出错，并导出 PhysX 专属的 PM_AndroidNDK_PATH
+          $ndkPath = $env:RAW_NDK_PATH -replace '\\', '/'
+          $env:PM_AndroidNDK_PATH = $ndkPath
+          $env:ANDROID_NDK_ROOT = $ndkPath
+          $env:NDK_ROOT = $ndkPath
+
+          "PM_AndroidNDK_PATH=$ndkPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "ANDROID_NDK_ROOT=$ndkPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Write-Host "PM_AndroidNDK_PATH: $env:PM_AndroidNDK_PATH"
           cmake --version
-          python --version
 
           Set-Location physx
 
@@ -78,8 +83,8 @@ jobs:
 
           "PRESET_NAME=$presetName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-          # 调用 Windows 原生批处理脚本生成工程
-          cmd /c "generate_projects.bat $presetName"
+          # 传入换行符避免批处理脚本异常时卡在 pause
+          cmd /c "echo. | generate_projects.bat $presetName"
           if ($LASTEXITCODE -ne 0) { throw "generate_projects.bat failed with exit code $LASTEXITCODE" }
 
           Write-Host "=== Generated compiler directories ==="
@@ -88,9 +93,6 @@ jobs:
       - name: Compile with Debug Symbols
         shell: pwsh
         env:
-          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
-          NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
-          ANDROID_NDK: ${{ steps.setup-ndk.outputs.ndk-path }}
           CONFIG: ${{ github.event.inputs.build_config || 'checked' }}
         run: |
           $ErrorActionPreference = "Stop"
@@ -117,8 +119,6 @@ jobs:
 
       - name: Verify Output & Debug Symbols
         shell: pwsh
-        env:
-          NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
           $ErrorActionPreference = "Stop"
           $libs = Get-ChildItem -Path "physx/bin" -Recurse -File -Include *.a, *.so
@@ -127,7 +127,7 @@ jobs:
           }
           $libs | ForEach-Object { Write-Host $_.FullName }
 
-          $readelf = Get-ChildItem -Path $env:NDK_PATH -Recurse -File -Include llvm-readelf.exe, aarch64-linux-android-readelf.exe | Select-Object -First 1 -ExpandProperty FullName
+          $readelf = Get-ChildItem -Path $env:PM_AndroidNDK_PATH -Recurse -File -Include llvm-readelf.exe, aarch64-linux-android-readelf.exe | Select-Object -First 1 -ExpandProperty FullName
           $firstLib = $libs | Select-Object -First 1 -ExpandProperty FullName
 
           if ($readelf -and $firstLib) {
