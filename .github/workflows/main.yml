@@ -1,0 +1,86 @@
+name: Build PhysX 4.1 Android arm64 (With Symbols)
+
+on:
+  workflow_dispatch: # 支持在 GitHub 页面手动触发
+    inputs:
+      build_config:
+        description: 'PhysX Build Configuration'
+        required: true
+        default: 'checked'
+        type: choice
+        options:
+          - debug     # 无优化 + 断言 + 完整符号 (-O0 -g)
+          - checked   # 适度优化 + API检查 + 符号
+          - profile   # 高性能 + PVD性能分析 + 强制附加符号 (-g)
+          - release   # 最高性能 + 强制附加符号 (-g)
+
+jobs:
+  build-android:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Android NDK (r21e)
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r21e
+          add-to-path: true
+
+      - name: Setup CMake & Python
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build python3
+
+      - name: Check Available Android Presets
+        run: ls -la physx/buildtools/presets/public/
+
+      - name: Generate PhysX Android arm64 Projects
+        env:
+          ANDROID_NDK_ROOT: ${{ env.ANDROID_NDK_HOME }}
+          NDK_ROOT: ${{ env.ANDROID_NDK_HOME }}
+        run: |
+          cd physx
+          # 注意：如果 preset 文件名为 android-arm64-v8a.xml，则参数为 android-arm64-v8a
+          # 如果仓库中只有 android.xml，需确认其内部 <platform> 是否指定了 arm64-v8a
+          ./generate_projects.sh android-arm64-v8a
+
+      - name: Compile with Debug Symbols
+        env:
+          ANDROID_NDK_ROOT: ${{ env.ANDROID_NDK_HOME }}
+          CONFIG: ${{ github.event.inputs.build_config || 'checked' }}
+        run: |
+          BUILD_DIR="physx/compiler/android-arm64-v8a-${CONFIG}"
+          
+          # 若选择 profile 或 release，强制向 CMake 缓存注入 -g 以保留完整调试符号，且禁止 strip
+          if [ "$CONFIG" = "release" ] || [ "$CONFIG" = "profile" ]; then
+            cmake -B "$BUILD_DIR" \
+              -DCMAKE_C_FLAGS_RELEASE="-O3 -g -DNDEBUG" \
+              -DCMAKE_CXX_FLAGS_RELEASE="-O3 -g -DNDEBUG" \
+              -DCMAKE_C_FLAGS_PROFILE="-O3 -g -DNDEBUG" \
+              -DCMAKE_CXX_FLAGS_PROFILE="-O3 -g -DNDEBUG"
+          fi
+
+          # 执行多线程编译（切勿执行 install/strip 目标，否则符号会被剥离）
+          cmake --build "$BUILD_DIR" --config "$CONFIG" -j$(nproc)
+
+      - name: Verify Debug Symbols in Output
+        env:
+          CONFIG: ${{ github.event.inputs.build_config || 'checked' }}
+        run: |
+          find physx/bin/android* -name "*.a" -o -name "*.so"
+          # 使用 readelf 检查是否包含 .debug_info 段
+          FIRST_LIB=$(find physx/bin/android* -name "*.a" -o -name "*.so" | head -n 1)
+          if [ -n "$FIRST_LIB" ]; then
+            $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf -S "$FIRST_LIB" | grep debug || true
+          fi
+
+      - name: Upload Build Artifacts (Libraries & Headers)
+        uses: actions/upload-artifact@v4
+        with:
+          name: physx-4.1-android-arm64-${{ github.event.inputs.build_config || 'checked' }}-symbols
+          path: |
+            physx/bin/android*
+            physx/include
+            pxshared/include
