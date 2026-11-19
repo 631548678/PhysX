@@ -1,18 +1,26 @@
 name: Build PhysX 4.1 Android arm64 (With Symbols)
 
 on:
-  workflow_dispatch: # 支持在 GitHub Actions 页面手动触发
+  workflow_dispatch:
     inputs:
       build_config:
-        description: 'PhysX Build Configuration'
+        description: 'PhysX 编译配置 (Build Configuration)'
         required: true
         default: 'checked'
         type: choice
         options:
           - debug     # 无优化 + 断言 + 完整符号 (-O0 -g)
           - checked   # 适度优化 + API检查 + 符号
-          - profile   # 高性能 + PVD性能分析 + 强制附加符号 (-g)
+          - profile   # 高性能 + PVD分析 + 强制附加符号 (-g)
           - release   # 最高性能 + 强制附加符号 (-g)
+      lib_type:
+        description: '输出库类型 (Library Type)'
+        required: true
+        default: 'static'
+        type: choice
+        options:
+          - static    # 静态库 (.a)
+          - shared    # 动态库 (.so)
 
 jobs:
   build-android:
@@ -29,61 +37,85 @@ jobs:
           ndk-version: r21e
           add-to-path: true
 
-      - name: Setup Build Tools
+      - name: Setup Compatible CMake (3.19.8) & Ninja
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: 3.19.8
+
+      - name: Install Python3 & Basic Tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build python3
+          sudo apt-get install -y python3 build-essential
 
-      - name: Detect Preset & Generate PhysX Projects
+      - name: Configure Preset & Generate PhysX Projects
         env:
-          # 覆盖 PhysX 4.1 构建脚本可能读取的所有 NDK 环境变量
+          # 覆盖 PhysX 4.1 脚本及旧版 toolchain 可能读取的所有 NDK 环境变量
           ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
           NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_NDK: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          LIB_TYPE: ${{ github.event.inputs.lib_type || 'static' }}
         run: |
           set -e
           echo "Resolved NDK Path: $ANDROID_NDK_ROOT"
-          ls -la physx/buildtools/presets/public/
+          cmake --version
 
           cd physx
-          # 自动判断仓库中是否存在 android-arm64-v8a.xml，否则回退并修改 android.xml
+
+          # 1. 自动识别 Preset 文件名（兼容 android-arm64-v8a.xml 与旧版 android.xml）
           if [ -f "buildtools/presets/public/android-arm64-v8a.xml" ]; then
             PRESET_NAME="android-arm64-v8a"
-          else
+          elif [ -f "buildtools/presets/public/android.xml" ]; then
             PRESET_NAME="android"
-            # 确保旧版 android.xml 目标架构为 arm64-v8a
             sed -i 's/armeabi-v7a/arm64-v8a/g' buildtools/presets/public/android.xml
+          else
+            echo "Error: No android preset found in buildtools/presets/public/"
+            ls -la buildtools/presets/public/
+            exit 1
           fi
 
-          echo "Using preset: $PRESET_NAME"
+          PRESET_FILE="buildtools/presets/public/${PRESET_NAME}.xml"
+          echo "Using preset file: $PRESET_FILE"
+
+          # 2. 根据用户选择配置静态库 (.a) 或动态库 (.so)
+          if [ "$LIB_TYPE" = "shared" ]; then
+            sed -i 's/PX_GENERATE_STATIC_LIBRARIES" value="True"/PX_GENERATE_STATIC_LIBRARIES" value="False"/g' "$PRESET_FILE"
+          else
+            sed -i 's/PX_GENERATE_STATIC_LIBRARIES" value="False"/PX_GENERATE_STATIC_LIBRARIES" value="True"/g' "$PRESET_FILE"
+          fi
+
+          # 3. 写入环境变量供后续步骤使用
           echo "PRESET_NAME=$PRESET_NAME" >> $GITHUB_ENV
+
+          # 4. 确保脚本有执行权限并生成工程
+          chmod +x generate_projects.sh
           ./generate_projects.sh "$PRESET_NAME"
 
-          echo "Generated compiler directories:"
-          ls -la compiler/
+          echo "Generated compiler directory structure:"
+          find compiler -maxdepth 3 -type d
 
       - name: Compile with Debug Symbols
         env:
           ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
           NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_NDK: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           CONFIG: ${{ github.event.inputs.build_config || 'checked' }}
         run: |
           set -e
-          # 动态查找对应 preset 和 config 的编译目录（兼容带 .clang 或其他后缀的目录名）
-          BUILD_DIR=$(find physx/compiler -maxdepth 1 -type d -name "${PRESET_NAME}*${CONFIG}" | head -n 1)
+          # 兼容 physx/compiler/public/<preset>-<config> 及 physx/compiler/<preset>-<config>（不区分大小写）
+          BUILD_DIR=$(find physx/compiler -maxdepth 3 -type d -iname "${PRESET_NAME}*${CONFIG}" | head -n 1)
 
           if [ -z "$BUILD_DIR" ] || [ ! -d "$BUILD_DIR" ]; then
             echo "Error: Could not find build directory for preset '${PRESET_NAME}' and config '${CONFIG}'."
-            echo "Available directories in physx/compiler/:"
-            ls -la physx/compiler/ || true
+            echo "All directories under physx/compiler/:"
+            find physx/compiler -maxdepth 3 -type d || true
             exit 1
           fi
 
-          echo "Building in directory: $BUILD_DIR"
+          echo "Found BUILD_DIR: $BUILD_DIR"
 
-          # 若选择 profile 或 release，向 CMake 缓存强制注入 -g 以保留完整调试符号
+          # 若选择 profile 或 release，强制注入 -g 保留完整调试符号，同时禁止隐藏符号表
           if [ "$CONFIG" = "release" ] || [ "$CONFIG" = "profile" ]; then
             cmake -B "$BUILD_DIR" \
               -DCMAKE_C_FLAGS_RELEASE="-O3 -g -DNDEBUG" \
@@ -95,26 +127,41 @@ jobs:
           # 执行多线程编译（不执行 install/strip，防止剥离 DWARF 调试符号）
           cmake --build "$BUILD_DIR" -j$(nproc)
 
-      - name: Verify Debug Symbols in Output
+      - name: Verify Output & Debug Symbols
         env:
           NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
-          echo "Compiled libraries:"
-          find physx/bin/ -type f \( -name "*.a" -o -name "*.so" \)
+          set -e
+          echo "=== Searching compiled libraries in physx/bin ==="
+          LIBS=$(find physx/bin/ -type f \( -name "*.a" -o -name "*.so" \))
 
-          FIRST_LIB=$(find physx/bin/ -type f \( -name "*.a" -o -name "*.so" \) | head -n 1)
-          if [ -n "$FIRST_LIB" ]; then
-            echo "Checking DWARF debug sections in: $FIRST_LIB"
-            "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -S "$FIRST_LIB" | grep debug
-          else
-            echo "Warning: No .a or .so files found in physx/bin/"
+          if [ -z "$LIBS" ]; then
+            echo "Error: Compilation finished but no .a or .so files were found in physx/bin/!"
+            find physx/ -maxdepth 4 -type d
             exit 1
+          fi
+
+          echo "$LIBS"
+
+          # 自动查找 NDK 中的 llvm-readelf 或 readelf 验证 DWARF 调试段
+          READELF_BIN=$(find "$NDK_PATH" -name "llvm-readelf" -o -name "aarch64-linux-android-readelf" | head -n 1)
+          FIRST_LIB=$(echo "$LIBS" | head -n 1)
+
+          if [ -n "$READELF_BIN" ] && [ -n "$FIRST_LIB" ]; then
+            echo "=== Checking DWARF debug sections in: $FIRST_LIB ==="
+            "$READELF_BIN" -S "$FIRST_LIB" | grep -E "debug_info|debug_line" || {
+              echo "Warning: No .debug_info section detected in $FIRST_LIB"
+              exit 1
+            }
+            echo "Success: Debug symbols verified!"
+          else
+            echo "Warning: readelf tool not found in NDK, skipping symbol header check."
           fi
 
       - name: Upload Build Artifacts (Libraries & Headers)
         uses: actions/upload-artifact@v4
         with:
-          name: physx-4.1-android-arm64-${{ github.event.inputs.build_config || 'checked' }}-symbols
+          name: physx-4.1-android-arm64-${{ github.event.inputs.build_config || 'checked' }}-${{ github.event.inputs.lib_type || 'static' }}-symbols
           path: |
             physx/bin/
             physx/include/
