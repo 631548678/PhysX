@@ -1,4 +1,4 @@
-name: Build PhysX 4.1 Android arm64 (With Symbols)
+name: Build PhysX 4.1 Android arm64 (Windows Host)
 
 on:
   workflow_dispatch:
@@ -24,21 +24,9 @@ on:
 
 jobs:
   build-android:
-    runs-on: ubuntu-22.04
-    container:
-      image: ubuntu:20.04
+    runs-on: windows-2022
 
     steps:
-      - name: Install Base Dependencies in Ubuntu 20.04
-        run: |
-          export DEBIAN_FRONTEND=noninteractive
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            ca-certificates curl unzip git build-essential \
-            cmake ninja-build python3 python-is-python3
-          cmake --version
-          python --version
-
       - name: Checkout Repository
         uses: actions/checkout@v4
 
@@ -49,93 +37,103 @@ jobs:
           ndk-version: r21e
           add-to-path: true
 
-      - name: Export NDK Environment Variables
-        run: |
-          echo "ANDROID_NDK_ROOT=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
-          echo "NDK_ROOT=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
-          echo "ANDROID_NDK=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
-          echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
+      - name: Setup Compatible CMake (3.19.8) & Ninja
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: 3.19.8
 
       - name: Configure Preset & Generate PhysX Projects
+        shell: pwsh
         env:
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+          NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           LIB_TYPE: ${{ github.event.inputs.lib_type || 'static' }}
         run: |
-          set -e
-          echo "Resolved NDK Path: $ANDROID_NDK_ROOT"
-          cd physx
+          $ErrorActionPreference = "Stop"
+          Write-Host "NDK Path: $env:ANDROID_NDK_ROOT"
+          cmake --version
+          python --version
 
-          if [ -f "buildtools/presets/public/android-arm64-v8a.xml" ]; then
-            PRESET_NAME="android-arm64-v8a"
-          elif [ -f "buildtools/presets/public/android.xml" ]; then
-            PRESET_NAME="android"
-            sed -i 's/armeabi-v7a/arm64-v8a/g' buildtools/presets/public/android.xml
-          else
-            echo "Error: No android preset found in buildtools/presets/public/"
-            ls -la buildtools/presets/public/
-            exit 1
-          fi
+          Set-Location physx
 
-          PRESET_FILE="buildtools/presets/public/${PRESET_NAME}.xml"
-          if [ "$LIB_TYPE" = "shared" ]; then
-            sed -i 's/PX_GENERATE_STATIC_LIBRARIES" value="True"/PX_GENERATE_STATIC_LIBRARIES" value="False"/g' "$PRESET_FILE"
-          else
-            sed -i 's/PX_GENERATE_STATIC_LIBRARIES" value="False"/PX_GENERATE_STATIC_LIBRARIES" value="True"/g' "$PRESET_FILE"
-          fi
+          if (Test-Path "buildtools/presets/public/android-arm64-v8a.xml") {
+            $presetName = "android-arm64-v8a"
+          } elseif (Test-Path "buildtools/presets/public/android.xml") {
+            $presetName = "android"
+            (Get-Content "buildtools/presets/public/android.xml") -replace 'armeabi-v7a', 'arm64-v8a' | Set-Content "buildtools/presets/public/android.xml"
+          } else {
+            Write-Error "No android preset found in buildtools/presets/public/"
+          }
 
-          echo "PRESET_NAME=$PRESET_NAME" >> $GITHUB_ENV
-          chmod +x generate_projects.sh
-          ./generate_projects.sh "$PRESET_NAME"
+          $presetFile = "buildtools/presets/public/$presetName.xml"
+          $content = Get-Content $presetFile -Raw
+          if ($env:LIB_TYPE -eq "shared") {
+            $content = $content -replace 'PX_GENERATE_STATIC_LIBRARIES" value="True"', 'PX_GENERATE_STATIC_LIBRARIES" value="False"'
+          } else {
+            $content = $content -replace 'PX_GENERATE_STATIC_LIBRARIES" value="False"', 'PX_GENERATE_STATIC_LIBRARIES" value="True"'
+          }
+          Set-Content -Path $presetFile -Value $content
 
-          echo "=== Generated compiler directories ==="
-          find compiler -maxdepth 3 -type d
-          DIR_COUNT=$(find compiler -mindepth 2 -maxdepth 3 -type d | wc -l)
-          if [ "$DIR_COUNT" -eq 0 ]; then
-            echo "Error: generate_projects.sh did not generate any build directories!"
-            exit 1
-          fi
+          "PRESET_NAME=$presetName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          # 调用 Windows 原生批处理脚本生成工程
+          cmd /c "generate_projects.bat $presetName"
+          if ($LASTEXITCODE -ne 0) { throw "generate_projects.bat failed with exit code $LASTEXITCODE" }
+
+          Write-Host "=== Generated compiler directories ==="
+          Get-ChildItem -Path "compiler" -Recurse -Directory -Depth 2 | Select-Object FullName
 
       - name: Compile with Debug Symbols
+        shell: pwsh
         env:
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+          NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK: ${{ steps.setup-ndk.outputs.ndk-path }}
           CONFIG: ${{ github.event.inputs.build_config || 'checked' }}
         run: |
-          set -e
-          BUILD_DIR=$(find physx/compiler -maxdepth 3 -type d -iname "${PRESET_NAME}*${CONFIG}" | head -n 1)
+          $ErrorActionPreference = "Stop"
+          $buildDir = Get-ChildItem -Path "physx/compiler" -Recurse -Directory -Depth 2 |
+            Where-Object { $_.Name -like "$($env:PRESET_NAME)*$($env:CONFIG)" } |
+            Select-Object -First 1 -ExpandProperty FullName
 
-          if [ -z "$BUILD_DIR" ] || [ ! -d "$BUILD_DIR" ]; then
-            echo "Error: Could not find build directory for preset '${PRESET_NAME}' and config '${CONFIG}'."
-            find physx/compiler -maxdepth 3 -type d || true
-            exit 1
-          fi
+          if (-not $buildDir) {
+            Write-Error "Could not find build directory for preset '$($env:PRESET_NAME)' and config '$($env:CONFIG)'."
+          }
 
-          echo "Building in: $BUILD_DIR"
+          Write-Host "Building in: $buildDir"
 
-          if [ "$CONFIG" = "release" ] || [ "$CONFIG" = "profile" ]; then
-            cmake -B "$BUILD_DIR" \
-              -DCMAKE_C_FLAGS_RELEASE="-O3 -g -DNDEBUG" \
-              -DCMAKE_CXX_FLAGS_RELEASE="-O3 -g -DNDEBUG" \
-              -DCMAKE_C_FLAGS_PROFILE="-O3 -g -DNDEBUG" \
+          if ($env:CONFIG -eq "release" -or $env:CONFIG -eq "profile") {
+            cmake -B "$buildDir" `
+              -DCMAKE_C_FLAGS_RELEASE="-O3 -g -DNDEBUG" `
+              -DCMAKE_CXX_FLAGS_RELEASE="-O3 -g -DNDEBUG" `
+              -DCMAKE_C_FLAGS_PROFILE="-O3 -g -DNDEBUG" `
               -DCMAKE_CXX_FLAGS_PROFILE="-O3 -g -DNDEBUG"
-          fi
+          }
 
-          cmake --build "$BUILD_DIR" -j$(nproc)
+          cmake --build "$buildDir" --parallel
+          if ($LASTEXITCODE -ne 0) { throw "CMake build failed with exit code $LASTEXITCODE" }
 
       - name: Verify Output & Debug Symbols
+        shell: pwsh
+        env:
+          NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
-          set -e
-          LIBS=$(find physx/bin/ -type f \( -name "*.a" -o -name "*.so" \))
-          if [ -z "$LIBS" ]; then
-            echo "Error: No .a or .so files found in physx/bin/!"
-            exit 1
-          fi
-          echo "$LIBS"
+          $ErrorActionPreference = "Stop"
+          $libs = Get-ChildItem -Path "physx/bin" -Recurse -File -Include *.a, *.so
+          if (-not $libs) {
+            Write-Error "No .a or .so files found in physx/bin!"
+          }
+          $libs | ForEach-Object { Write-Host $_.FullName }
 
-          READELF_BIN=$(find "$ANDROID_NDK_ROOT" -name "llvm-readelf" -o -name "aarch64-linux-android-readelf" | head -n 1)
-          FIRST_LIB=$(echo "$LIBS" | head -n 1)
+          $readelf = Get-ChildItem -Path $env:NDK_PATH -Recurse -File -Include llvm-readelf.exe, aarch64-linux-android-readelf.exe | Select-Object -First 1 -ExpandProperty FullName
+          $firstLib = $libs | Select-Object -First 1 -ExpandProperty FullName
 
-          if [ -n "$READELF_BIN" ] && [ -n "$FIRST_LIB" ]; then
-            echo "=== Checking DWARF debug sections in: $FIRST_LIB ==="
-            "$READELF_BIN" -S "$FIRST_LIB" | grep -E "debug_info|debug_line"
-          fi
+          if ($readelf -and $firstLib) {
+            Write-Host "=== Checking DWARF debug sections in: $firstLib ==="
+            & $readelf -S "$firstLib" | Select-String -Pattern "debug_info|debug_line"
+          }
 
       - name: Upload Build Artifacts (Libraries & Headers)
         uses: actions/upload-artifact@v4
